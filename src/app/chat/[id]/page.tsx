@@ -270,6 +270,17 @@ export default function ChatWithIdPage() {
                             setMessages(prev => prev.map(m =>
                                 m.id === tempAssistantMessage.id ? { ...m, content: streamedContent } : m
                             ));
+                        } else if (data.type === 'done') {
+                            setMessages(prev => prev.map(m =>
+                                m.id === tempAssistantMessage.id ? {
+                                    ...m,
+                                    content: streamedContent,
+                                    isStreaming: false,
+                                    model: selectedModel,
+                                    tokens: data.tokens,
+                                    citations: data.citations,
+                                } : m
+                            ));
                         } else if (data.type === 'error') {
                             streamedContent = data.error;
                             setMessages(prev => prev.map(m =>
@@ -282,7 +293,7 @@ export default function ChatWithIdPage() {
             }
 
             setMessages(prev => prev.map(m =>
-                m.id === tempAssistantMessage.id ? { ...m, content: streamedContent, isStreaming: false, model: selectedModel } : m
+                m.id === tempAssistantMessage.id && m.isStreaming ? { ...m, content: streamedContent, isStreaming: false, model: selectedModel } : m
             ));
 
         } catch (error) {
