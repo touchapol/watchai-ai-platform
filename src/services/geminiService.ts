@@ -1,4 +1,4 @@
-import { GoogleGenerativeAI, GenerateContentResponse, GenerateContentResult } from '@google/generative-ai';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 import {
     getAvailableApiKey,
     incrementApiKeyUsage,
@@ -54,7 +54,7 @@ export async function streamCompletion(
         });
 
         const chat = geminiModel.startChat({ history });
-        const result: GenerateContentResult = await chat.sendMessageStream(messageContent);
+        const result = await chat.sendMessageStream(messageContent);
 
         for await (const chunk of result.stream) {
             const text = chunk.text();
@@ -62,7 +62,7 @@ export async function streamCompletion(
             callbacks.onChunk(text);
         }
 
-        const response: GenerateContentResponse = await result.response;
+        const response = await result.response;
         const usageMetadata = response.usageMetadata;
         promptTokens = usageMetadata?.promptTokenCount || 0;
         completionTokens = usageMetadata?.candidatesTokenCount || 0;
