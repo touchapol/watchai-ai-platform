@@ -4,88 +4,28 @@ import { getCurrentUser } from '@/lib/auth';
 import { logEvent, logLLM } from '@/lib/logger';
 import { logError } from '@/lib/errorLogger';
 import { SYSTEM_INSTRUCTION } from '@/lib/constants';
-import { GoogleGenerativeAI } from '@google/generative-ai';
-import OpenAI from 'openai';
-import { readFile } from 'fs/promises';
-import path from 'path';
 import { createMessage, getRecentMessages, ChatMessage } from '@/lib/messages';
-import { decryptApiKey, isEncrypted } from '@/lib/encryption';
 import { getMemoriesForContext } from '@/lib/memory';
 import { searchSimilarChunks } from '@/lib/embedding';
-
-
-
-async function getAvailableApiKey(providerName: string) {
-    const now = new Date();
-    const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-
-    const apiKeys = await prisma.apiKey.findMany({
-        where: {
-            aiProvider: { name: providerName },
-            isActive: true,
-            isRateLimited: false,
-        },
-        orderBy: { priority: 'desc' },
-    });
-
-    for (const key of apiKeys) {
-        if (key.lastResetAt < startOfDay) {
-            await prisma.apiKey.update({
-                where: { id: key.id },
-                data: { dailyUsed: 0, minuteUsed: 0, lastResetAt: now, isRateLimited: false },
-            });
-            key.dailyUsed = 0;
-        }
-
-        if (key.dailyLimit && key.dailyUsed >= key.dailyLimit) {
-            continue;
-        }
-
-        return key;
-    }
-
-    return null;
-}
-
-async function incrementApiKeyUsage(keyId: string, tokens: number = 0) {
-    const now = new Date();
-    const key = await prisma.apiKey.findUnique({ where: { id: keyId } });
-    if (!key) return;
-
-    const startOfMinute = new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours(), now.getMinutes());
-    const shouldResetMinute = key.lastMinuteResetAt < startOfMinute;
-
-    await prisma.apiKey.update({
-        where: { id: keyId },
-        data: {
-            dailyUsed: { increment: 1 },
-            dailyTokenUsed: { increment: tokens },
-            minuteUsed: shouldResetMinute ? 1 : { increment: 1 },
-            minuteTokenUsed: shouldResetMinute ? tokens : { increment: tokens },
-            lastMinuteResetAt: shouldResetMinute ? now : undefined,
-            lastUsedAt: now,
-        },
-    });
-}
-
-async function markApiKeyRateLimited(keyId: string) {
-    await prisma.apiKey.update({
-        where: { id: keyId },
-        data: {
-            isRateLimited: true,
-            rateLimitedAt: new Date(),
-        },
-    });
-}
+import {
+    getAvailableApiKey,
+    incrementApiKeyUsage,
+    decryptKey,
+    processAttachments,
+    convertToOpenAIContent,
+    buildOpenAIMessages,
+    Citation,
+    GeminiMessageContent,
+} from '@/services/llmService';
+import * as openaiService from '@/services/openaiService';
+import * as geminiService from '@/services/geminiService';
 
 export async function GET() {
     try {
         const models = await prisma.aiModel.findMany({
             where: {
                 isActive: true,
-                provider: {
-                    isActive: true,
-                }
+                provider: { isActive: true }
             },
             select: {
                 id: true,
@@ -114,7 +54,7 @@ export async function GET() {
         }
 
         return NextResponse.json({
-            models: models.map(m => ({
+            models: models.map((m: typeof models[number]) => ({
                 id: m.name,
                 name: m.name,
                 displayName: m.displayName,
@@ -168,7 +108,6 @@ export async function POST(request: Request) {
             return NextResponse.json({ error: 'กรุณาพิมพ์ข้อความ' }, { status: 400 });
         }
 
-
         let conversation;
         let existingMessages: ChatMessage[] = [];
 
@@ -181,7 +120,6 @@ export async function POST(request: Request) {
                 return NextResponse.json({ error: 'ไม่พบการสนทนา' }, { status: 404 });
             }
 
-
             existingMessages = await getRecentMessages(conversationId, 20);
         } else {
             conversation = await prisma.conversation.create({
@@ -192,12 +130,10 @@ export async function POST(request: Request) {
             });
         }
 
-
         const history = existingMessages.map((msg) => ({
             role: msg.role === 'USER' ? 'user' as const : 'model' as const,
             parts: [{ text: msg.content }],
         }));
-
 
         let userMessage: Awaited<ReturnType<typeof createMessage>> | undefined;
         if (!isRetry) {
@@ -212,87 +148,43 @@ export async function POST(request: Request) {
             });
         }
 
-
-        let messageContent: string | Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> = content;
+        let geminiContent: GeminiMessageContent = content;
+        let fileNames: string[] = [];
 
         if (attachments && attachments.length > 0) {
-            const fileRecords = await prisma.file.findMany({
-                where: { id: { in: attachments }, userId: user.id },
-            });
-
-            if (fileRecords.length > 0) {
-                const parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> = [];
-                let documentContents = '';
-
-                for (const fileRecord of fileRecords) {
-                    const filePath = path.join(process.cwd(), 'uploads', fileRecord.storagePath);
-                    try {
-                        const fileBuffer = await readFile(filePath);
-
-                        if (fileRecord.type === 'IMAGE') {
-                            const mimeType = fileRecord.mimeType || 'image/jpeg';
-                            const base64Data = fileBuffer.toString('base64');
-                            parts.push({ inlineData: { mimeType, data: base64Data } });
-                        } else if (fileRecord.type === 'DOCUMENT') {
-                            const fileContent = fileBuffer.toString('utf-8');
-                            documentContents += `\n\n--- เอกสาร: ${fileRecord.filename} ---\n${fileContent}`;
-                        }
-                    } catch (err) {
-                        console.error(`Failed to read file ${fileRecord.filename}:`, err);
-                    }
-                }
-
-                if (parts.length > 0) {
-                    const textContent = documentContents
-                        ? `${documentContents}\n\n---\n\nคำถาม: ${content}`
-                        : content;
-                    parts.push({ text: textContent });
-                    messageContent = parts;
-                } else if (documentContents) {
-                    messageContent = `${documentContents}\n\n---\n\nคำถาม: ${content}`;
-                }
+            const processed = await processAttachments(attachments, user.id);
+            if (typeof processed.geminiContent !== 'string' && Array.isArray(processed.geminiContent)) {
+                const textContent = processed.files
+                    .filter(f => f.type === 'DOCUMENT')
+                    .map(f => `\n\n--- เอกสาร: ${f.filename} ---\n${f.data}`)
+                    .join('');
+                const finalText = textContent ? `${textContent}\n\n---\n\nคำถาม: ${content}` : content;
+                geminiContent = [...processed.geminiContent, { text: finalText }];
+            } else if (typeof processed.geminiContent === 'string' && processed.geminiContent) {
+                geminiContent = `${processed.geminiContent}\n\n---\n\nคำถาม: ${content}`;
             }
+            fileNames = processed.files.map(f => f.filename);
         }
-
 
         const modelRecord = await prisma.aiModel.findFirst({
             where: { name: modelId, isActive: true },
             include: { provider: true },
         });
 
-
         const providerName = modelRecord?.provider?.name || 'gemini';
         const apiKey = await getAvailableApiKey(providerName);
-
 
         if (!apiKey) {
             return NextResponse.json({ error: 'ไม่มี API Key ที่พร้อมใช้งาน' }, { status: 503 });
         }
 
-        let apiKeyValue = apiKey.apiKey;
-
-
-        if (apiKeyValue && isEncrypted(apiKeyValue)) {
-            apiKeyValue = decryptApiKey(apiKeyValue);
-        }
-
-
-        const encoder = new TextEncoder();
-        let fullContent = '';
-        let totalTokens = 0;
-        let promptTokens = 0;
-        let completionTokens = 0;
-
-
         const isOpenAI = providerName === 'openai';
-
 
         const settings = await prisma.systemSettings.findUnique({ where: { id: 'system' } });
         const memoryEnabled = settings?.enableLongTermMemory !== false;
         const ragEnabled = settings?.enableRAG === true;
 
         const memoryContext = memoryEnabled ? await getMemoriesForContext(user.id) : '';
-
 
         let ragContext = '';
         if (ragEnabled) {
@@ -301,7 +193,6 @@ export async function POST(request: Request) {
                 ragContext = similarChunks.map(c => `[${c.docName}]: ${c.content}`).join('\n\n');
             }
         }
-
 
         let enhancedSystemInstruction = SYSTEM_INSTRUCTION;
 
@@ -313,134 +204,83 @@ export async function POST(request: Request) {
             enhancedSystemInstruction += `\n\n--- ข้อมูลจากคลังความรู้ (Knowledge Base) ---\nใช้ข้อมูลต่อไปนี้ในการตอบคำถาม ถ้าเกี่ยวข้อง (ห้ามใส่ [cite:...] หรืออ้างอิงชื่อไฟล์ในคำตอบ):\n${ragContext}`;
         }
 
-
-        const openaiMessages: { role: 'system' | 'user' | 'assistant'; content: string }[] = isOpenAI ? [
-            { role: 'system', content: enhancedSystemInstruction },
-            ...history.map(h => ({
-                role: h.role === 'model' ? 'assistant' as const : 'user' as const,
-                content: h.parts.map((p: { text?: string }) => p.text || '').join(''),
-            })),
-            { role: 'user' as const, content: typeof messageContent === 'string' ? messageContent : content },
-        ] : [];
+        const encoder = new TextEncoder();
+        let fullContent = '';
+        let promptTokens = 0;
+        let completionTokens = 0;
+        let totalTokens = 0;
+        let citations: Citation[] = [];
 
         const stream = new ReadableStream({
             async start(controller) {
                 try {
-
                     controller.enqueue(encoder.encode(`data: ${JSON.stringify({
                         type: 'start',
                         conversationId: conversation.id,
                         userMessageId: userMessage?._id?.toString(),
                     })}\n\n`));
 
-
-                    interface Citation {
-                        source: string;
-                        content: string;
-                        url?: string;
-                        startIndex?: number;
-                        endIndex?: number;
-                    }
-                    let citations: Citation[] = [];
-
-                    if (isOpenAI) {
-
-                        const openai = new OpenAI({ apiKey: apiKeyValue });
-                        const openaiStream = await openai.chat.completions.create({
-                            model: modelId,
-                            messages: openaiMessages,
-                            stream: true,
-                            stream_options: { include_usage: true },
-                        });
-
-                        for await (const chunk of openaiStream) {
-                            const text = chunk.choices[0]?.delta?.content || '';
-                            if (text) {
-                                fullContent += text;
-                                controller.enqueue(encoder.encode(`data: ${JSON.stringify({
-                                    type: 'chunk',
-                                    content: text,
-                                })}\n\n`));
-                            }
-                            if (chunk.usage) {
-                                promptTokens = chunk.usage.prompt_tokens || 0;
-                                completionTokens = chunk.usage.completion_tokens || 0;
-                                totalTokens = promptTokens + completionTokens;
-                            }
-                        }
-                    } else {
-
-                        const genAI = new GoogleGenerativeAI(apiKeyValue);
-                        const geminiModel = genAI.getGenerativeModel({
-                            model: modelId,
-                            systemInstruction: enhancedSystemInstruction,
-                            tools: [{ googleSearch: {} }] as never,
-                        });
-
-                        const chat = geminiModel.startChat({ history });
-                        const result = await chat.sendMessageStream(messageContent);
-
-                        for await (const chunk of result.stream) {
-                            const text = chunk.text();
+                    const streamCallbacks = {
+                        onChunk: (text: string) => {
                             fullContent += text;
                             controller.enqueue(encoder.encode(`data: ${JSON.stringify({
                                 type: 'chunk',
                                 content: text,
                             })}\n\n`));
-                        }
+                        },
+                        onError: (error: Error) => {
+                            console.error('Stream error:', error);
+                        },
+                    };
 
+                    if (isOpenAI) {
+                        const openaiContent = convertToOpenAIContent(geminiContent, content);
+                        const messages = buildOpenAIMessages(enhancedSystemInstruction, history, openaiContent);
 
-                        const response = await result.response;
-                        const usageMetadata = response.usageMetadata;
-                        promptTokens = usageMetadata?.promptTokenCount || 0;
-                        completionTokens = usageMetadata?.candidatesTokenCount || 0;
-                        totalTokens = usageMetadata?.totalTokenCount || 0;
-
-
-                        const candidates = response.candidates;
-                        if (candidates && candidates[0]) {
-                            const groundingMetadata = candidates[0].groundingMetadata;
-                            if (groundingMetadata) {
-                                const chunks = groundingMetadata.groundingChunks || [];
-                                const supports = groundingMetadata.groundingSupports || [];
-
-
-                                chunks.forEach((chunk: any, index: number) => {
-                                    if (chunk.web) {
-
-                                        const support = supports.find((s: any) =>
-                                            s.groundingChunkIndices?.includes(index)
-                                        );
-                                        const seg = support?.segment as { startIndex?: number; endIndex?: number } | undefined;
-                                        citations.push({
-                                            source: chunk.web.title || `Source ${index + 1}`,
-                                            content: '',
-                                            url: chunk.web.uri,
-                                            startIndex: seg?.startIndex,
-                                            endIndex: seg?.endIndex,
-                                        });
-                                    }
-                                });
-                            }
-                        }
-                    }
-
-
-                    if (attachments && attachments.length > 0) {
-                        const fileRecords = await prisma.file.findMany({
-                            where: { id: { in: attachments } },
-                            select: { filename: true }
+                        const result = await openaiService.streamCompletion(messages, modelId, {
+                            ...streamCallbacks,
+                            onUsage: (pt, ct) => {
+                                promptTokens = pt;
+                                completionTokens = ct;
+                                totalTokens = pt + ct;
+                            },
                         });
-                        for (const fileRecord of fileRecords) {
-                            if (fileRecord && fullContent.length > 0) {
-                                citations.push({
-                                    source: fileRecord.filename,
-                                    content: '',
-                                });
+
+                        fullContent = result.fullContent;
+                        promptTokens = result.promptTokens;
+                        completionTokens = result.completionTokens;
+                        totalTokens = result.totalTokens;
+                    } else {
+                        const result = await geminiService.streamCompletion(
+                            modelId,
+                            enhancedSystemInstruction,
+                            history,
+                            geminiContent,
+                            {
+                                ...streamCallbacks,
+                                onUsage: (pt, ct, tt) => {
+                                    promptTokens = pt;
+                                    completionTokens = ct;
+                                    totalTokens = tt;
+                                },
+                                onCitations: (c) => {
+                                    citations = c;
+                                },
                             }
-                        }
+                        );
+
+                        fullContent = result.fullContent;
+                        promptTokens = result.promptTokens;
+                        completionTokens = result.completionTokens;
+                        totalTokens = result.totalTokens;
+                        citations = result.citations;
                     }
 
+                    if (fileNames.length > 0 && fullContent.length > 0) {
+                        for (const filename of fileNames) {
+                            citations.push({ source: filename, content: '' });
+                        }
+                    }
 
                     const assistantMessage = await createMessage({
                         conversationId: conversation.id,
@@ -453,12 +293,10 @@ export async function POST(request: Request) {
                         citations: citations.length > 0 ? citations : undefined,
                     });
 
-
                     await prisma.conversation.update({
                         where: { id: conversation.id },
                         data: { updatedAt: new Date() },
                     });
-
 
                     const latencyMs = Date.now() - startTime;
                     await logEvent(user.id, 'CHAT_MESSAGE', '/api/chat', {
@@ -475,11 +313,9 @@ export async function POST(request: Request) {
                         status: 'SUCCESS',
                     });
 
-
                     if (apiKey) {
                         await incrementApiKeyUsage(apiKey.id, totalTokens);
                     }
-
 
                     controller.enqueue(encoder.encode(`data: ${JSON.stringify({
                         type: 'done',
@@ -491,7 +327,6 @@ export async function POST(request: Request) {
                     controller.close();
                 } catch (error) {
                     console.error('Streaming error:', error);
-
 
                     let errorMessage = 'เกิดข้อผิดพลาดในการส่งข้อความ';
                     const errorStr = String(error);
@@ -527,7 +362,6 @@ export async function POST(request: Request) {
                         })}\n\n`));
                         controller.close();
                     } catch {
-
                     }
                 }
             },

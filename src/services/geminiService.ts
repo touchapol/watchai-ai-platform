@@ -1,122 +1,157 @@
-import { GoogleGenAI, GenerateContentResponse } from "@google/genai";
-import prisma from '@/lib/db';
+import { GoogleGenerativeAI, GenerateContentResponse, GenerateContentResult } from '@google/generative-ai';
+import {
+    getAvailableApiKey,
+    incrementApiKeyUsage,
+    markApiKeyRateLimited,
+    decryptKey,
+    GeminiMessageContent,
+    Citation,
+} from './llmService';
 
-interface ApiKeyData {
-    id: string;
-    apiKey: string;
-    dailyUsed: number;
-    dailyLimit: number | null;
-    isActive: boolean;
-    isRateLimited: boolean;
+export interface StreamCallbacks {
+    onChunk: (text: string) => void;
+    onUsage: (promptTokens: number, completionTokens: number, totalTokens: number) => void;
+    onCitations: (citations: Citation[]) => void;
+    onError: (error: Error) => void;
 }
 
-let cachedKeys: ApiKeyData[] = [];
-let lastFetch = 0;
-const CACHE_TTL = 60000;
-
-async function getActiveApiKey(): Promise<string> {
-    const now = Date.now();
-
-    if (now - lastFetch > CACHE_TTL || cachedKeys.length === 0) {
-        const keys = await prisma.apiKey.findMany({
-            where: {
-                isActive: true,
-                isRateLimited: false,
-                provider: 'gemini'
-            },
-            orderBy: [{ priority: 'desc' }, { dailyUsed: 'asc' }],
-            select: {
-                id: true,
-                apiKey: true,
-                dailyUsed: true,
-                dailyLimit: true,
-                isActive: true,
-                isRateLimited: true,
-            }
-        });
-
-        cachedKeys = keys.filter(k => !k.dailyLimit || k.dailyUsed < k.dailyLimit);
-        lastFetch = now;
-    }
-
-    if (cachedKeys.length > 0) {
-        return cachedKeys[0].apiKey;
-    }
-
-    return process.env.NEXT_PUBLIC_GEMINI_API_KEY || 'dummy-key-for-ui-demo';
+export interface StreamResult {
+    success: boolean;
+    keyId?: string;
+    fullContent: string;
+    promptTokens: number;
+    completionTokens: number;
+    totalTokens: number;
+    citations: Citation[];
 }
 
-async function markKeyUsed(keyId: string): Promise<void> {
+export async function streamCompletion(
+    modelId: string,
+    systemInstruction: string,
+    history: Array<{ role: 'user' | 'model'; parts: Array<{ text: string }> }>,
+    messageContent: GeminiMessageContent,
+    callbacks: StreamCallbacks
+): Promise<StreamResult> {
+    const keyRecord = await getAvailableApiKey('gemini');
+    if (!keyRecord) {
+        callbacks.onError(new Error('No API key available'));
+        return { success: false, fullContent: '', promptTokens: 0, completionTokens: 0, totalTokens: 0, citations: [] };
+    }
+
+    const apiKey = decryptKey(keyRecord.apiKey);
+    let fullContent = '';
+    let promptTokens = 0;
+    let completionTokens = 0;
+    let totalTokens = 0;
+    const citations: Citation[] = [];
+
     try {
-        await prisma.apiKey.update({
-            where: { id: keyId },
-            data: {
-                dailyUsed: { increment: 1 },
-                minuteUsed: { increment: 1 },
-                lastUsedAt: new Date(),
-            }
+        const genAI = new GoogleGenerativeAI(apiKey);
+        const geminiModel = genAI.getGenerativeModel({
+            model: modelId,
+            systemInstruction,
+            tools: [{ googleSearch: {} }] as never,
         });
 
-        const key = cachedKeys.find(k => k.id === keyId);
-        if (key) key.dailyUsed++;
-    } catch {
-        // Ignore errors
+        const chat = geminiModel.startChat({ history });
+        const result: GenerateContentResult = await chat.sendMessageStream(messageContent);
+
+        for await (const chunk of result.stream) {
+            const text = chunk.text();
+            fullContent += text;
+            callbacks.onChunk(text);
+        }
+
+        const response: GenerateContentResponse = await result.response;
+        const usageMetadata = response.usageMetadata;
+        promptTokens = usageMetadata?.promptTokenCount || 0;
+        completionTokens = usageMetadata?.candidatesTokenCount || 0;
+        totalTokens = usageMetadata?.totalTokenCount || 0;
+        callbacks.onUsage(promptTokens, completionTokens, totalTokens);
+
+        const candidates = response.candidates;
+        if (candidates && candidates[0]) {
+            const groundingMetadata = candidates[0].groundingMetadata;
+            if (groundingMetadata) {
+                const chunks = groundingMetadata.groundingChunks || [];
+                const supports = groundingMetadata.groundingSupports || [];
+
+                chunks.forEach((chunk: unknown, index: number) => {
+                    const c = chunk as { web?: { title?: string; uri?: string } };
+                    if (c.web) {
+                        const support = supports.find((s: unknown) => {
+                            const sup = s as { groundingChunkIndices?: number[] };
+                            return sup.groundingChunkIndices?.includes(index);
+                        });
+                        const seg = (support as { segment?: { startIndex?: number; endIndex?: number } } | undefined)?.segment;
+                        citations.push({
+                            source: c.web.title || `Source ${index + 1}`,
+                            content: '',
+                            url: c.web.uri,
+                            startIndex: seg?.startIndex,
+                            endIndex: seg?.endIndex,
+                        });
+                    }
+                });
+
+                if (citations.length > 0) {
+                    callbacks.onCitations(citations);
+                }
+            }
+        }
+
+        await incrementApiKeyUsage(keyRecord.id, totalTokens);
+
+        return {
+            success: true,
+            keyId: keyRecord.id,
+            fullContent,
+            promptTokens,
+            completionTokens,
+            totalTokens,
+            citations,
+        };
+    } catch (error) {
+        callbacks.onError(error as Error);
+
+        const errorStr = String(error);
+        if (errorStr.includes('429') || errorStr.includes('quota')) {
+            await markApiKeyRateLimited(keyRecord.id);
+        }
+
+        return {
+            success: false,
+            keyId: keyRecord.id,
+            fullContent,
+            promptTokens,
+            completionTokens,
+            totalTokens,
+            citations,
+        };
     }
 }
 
-async function markKeyRateLimited(apiKey: string): Promise<void> {
-    try {
-        await prisma.apiKey.updateMany({
-            where: { apiKey },
-            data: {
-                isRateLimited: true,
-                rateLimitedAt: new Date(),
-            }
-        });
-
-        cachedKeys = cachedKeys.filter(k => k.apiKey !== apiKey);
-    } catch {
-        // Ignore errors
-    }
-}
-
-export const generateResponse = async (
+export async function generateResponse(
     prompt: string,
     model: string = 'gemini-2.5-flash-preview'
-): Promise<string> => {
-    const maxRetries = 3;
-    let lastError: Error | null = null;
-
-    for (let attempt = 0; attempt < maxRetries; attempt++) {
-        try {
-            const apiKey = await getActiveApiKey();
-            const ai = new GoogleGenAI({ apiKey });
-
-            const response: GenerateContentResponse = await ai.models.generateContent({
-                model,
-                contents: prompt,
-                config: {
-                    systemInstruction: "You are an AI Platform assistant. Respond using Markdown.",
-                }
-            });
-
-            const usedKey = cachedKeys.find(k => k.apiKey === apiKey);
-            if (usedKey) await markKeyUsed(usedKey.id);
-
-            return response.text || "No response generated.";
-        } catch (error) {
-            lastError = error as Error;
-            console.error("Gemini API Error:", error);
-
-            if (lastError.message?.includes('429') || lastError.message?.includes('quota')) {
-                const apiKey = await getActiveApiKey();
-                await markKeyRateLimited(apiKey);
-                continue;
-            }
-
-            break;
-        }
+): Promise<string> {
+    const keyRecord = await getAvailableApiKey('gemini');
+    if (!keyRecord) {
+        return 'Error: No Gemini API key available';
     }
 
-    return `**Error**: Unable to connect to LLM.\n\n*Simulated Response*: I understand you are asking about "${prompt}". As this is a UI demo without a live API key, I cannot generate a real-time response. \n\nHowever, I support:\n- Markdown rendering\n- Code blocks\n- Citations`;
-};
+    const apiKey = decryptKey(keyRecord.apiKey);
+
+    try {
+        const genAI = new GoogleGenerativeAI(apiKey);
+        const geminiModel = genAI.getGenerativeModel({ model });
+        const response = await geminiModel.generateContent(prompt);
+        const result = response.response;
+
+        await incrementApiKeyUsage(keyRecord.id, result.usageMetadata?.totalTokenCount || 0);
+        return result.text() || 'No response generated.';
+    } catch (error) {
+        console.error('Gemini API Error:', error);
+        return `Error: ${(error as Error).message}`;
+    }
+}

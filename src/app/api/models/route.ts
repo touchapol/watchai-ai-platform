@@ -20,7 +20,7 @@ export async function GET() {
             },
         });
 
-        const formatted = models.map(m => ({
+        const formatted = models.map((m: typeof models[number]) => ({
             id: m.name,
             name: m.displayName,
             provider: m.provider.name,

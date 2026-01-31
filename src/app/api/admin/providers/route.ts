@@ -55,9 +55,12 @@ export async function GET() {
             }
         });
 
-        const providersWithMaskedKeys = providers.map(provider => ({
+        type ProviderWithRelations = typeof providers[number];
+        type ApiKeyType = ProviderWithRelations['apiKeys'][number];
+
+        const providersWithMaskedKeys = providers.map((provider: ProviderWithRelations) => ({
             ...provider,
-            apiKeys: provider.apiKeys.map(key => {
+            apiKeys: provider.apiKeys.map((key: ApiKeyType) => {
                 let rawKey = key.apiKey;
                 if (isEncrypted(rawKey)) {
                     try {

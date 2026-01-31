@@ -80,7 +80,7 @@ export async function GET() {
         const totalChunks = await prisma.documentChunk.count();
 
         return NextResponse.json({
-            documents: documents.map(d => ({
+            documents: documents.map((d: typeof documents[number]) => ({
                 id: d.id,
                 filename: d.filename,
                 size: d.size,

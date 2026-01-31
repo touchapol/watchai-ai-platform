@@ -52,7 +52,7 @@ export async function GET() {
             select: { createdAt: true }
         });
 
-        conversations.forEach((conv) => {
+        conversations.forEach((conv: { createdAt: Date }) => {
             const dateStr = formatDateStr(new Date(conv.createdAt));
             if (dailyUsage[dateStr] !== undefined) {
                 dailyUsage[dateStr]++;
@@ -68,7 +68,7 @@ export async function GET() {
                 { $sort: { count: -1 } },
                 { $limit: 5 }
             ]).toArray();
-            topModels = modelAggregation.map(m => ({ model: m._id as string, count: m.count as number }));
+            topModels = modelAggregation.map((m: Record<string, unknown>) => ({ model: m._id as string, count: m.count as number }));
         } catch (e) {
             console.error('MongoDB error:', e);
         }
@@ -84,7 +84,7 @@ export async function GET() {
             take: 10
         });
 
-        const topUsers = topUsersData.map(u => ({
+        const topUsers = topUsersData.map((u: { id: string; username: string; email: string; _count: { conversations: number } }) => ({
             id: u.id,
             username: u.username,
             email: u.email,
