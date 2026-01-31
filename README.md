@@ -109,22 +109,32 @@ npm run dev
 src/
 ├── app/                    # Next.js App Router pages
 │   ├── api/               # API routes
-│   ├── admin/             # แผงควบคุมผู้ดูแล
+│   ├── admin/             # หน้าผู้ดูแลระบบ
 │   ├── chat/              # หน้าแชท
 │   ├── dashboard/         # แดชบอร์ดผู้ใช้
 │   ├── files/             # จัดการไฟล์
-│   └── login/             # หน้าเข้าสู่ระบบ
+│   ├── login/             # หน้าเข้าสู่ระบบ
+│   ├── register/          # หน้าสมัครสมาชิก
+│   ├── setup/             # หน้า Setup เริ่มต้น
+│   └── terms/             # หน้าข้อกำหนดการใช้งาน
 ├── components/            # React components
 │   ├── admin/            # Components สำหรับ Admin
 │   ├── chat/             # Components สำหรับ Chat
 │   ├── dashboard/        # Components สำหรับ Dashboard
 │   └── files/            # Components สำหรับ File Manager
+├── context/               # React Context providers
+├── hooks/                 # Custom React hooks
 ├── lib/                   # Utility libraries
 │   ├── auth.ts           # ระบบยืนยันตัวตน
 │   ├── db.ts             # Prisma client
 │   ├── mongodb.ts        # MongoDB connection
-│   └── logger.ts         # ระบบบันทึก Log
-└── types/                # TypeScript type definitions
+│   ├── logger.ts         # ระบบบันทึก Log
+│   ├── encryption.ts     # เข้ารหัส API keys
+│   ├── session.ts        # จัดการ Session
+│   └── ...               # อื่นๆ
+├── services/              # External service integrations
+│   └── geminiService.ts  # Google Gemini API
+└── types/                 # TypeScript type definitions
 ```
 
 ## API Endpoints
