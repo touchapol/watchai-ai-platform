@@ -1,0 +1,61 @@
+name: watchai
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - DATABASE_URL=postgresql://watchai:watchai123@postgres:5432/watchai?connection_limit=5&pool_timeout=30&connect_timeout=30
+      - MONGODB_URI=mongodb://watchai:watchai123@mongodb:27017/watchai?authSource=admin
+      - JWT_SECRET=WatchAI2026JWTSecretKeyForTokens!
+      - PASSWORD_SECRET_KEY=WatchAI2026SecretKeyForPassword!
+      - API_KEY_SECRET=WatchAI2026SecretKeyForAPIKeys!!
+    volumes:
+      - uploads:/app/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_USER=watchai
+      - POSTGRES_PASSWORD=watchai123
+      - POSTGRES_DB=watchai
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U watchai -d watchai" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  mongodb:
+    image: mongo:7
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=watchai
+      - MONGO_INITDB_ROOT_PASSWORD=watchai123
+    volumes:
+      - mongodb_data:/data/db
+    ports:
+      - "27017:27017"
+    healthcheck:
+      test: [ "CMD", "mongosh", "--eval", "db.adminCommand('ping')" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  mongodb_data:
+  uploads:

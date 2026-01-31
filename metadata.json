@@ -1,0 +1,5 @@
+{
+  "name": "AI Nexus Platform",
+  "description": "Enterprise-grade AI Platform Engineer exam implementation featuring LLM chat, RAG-ready file management, system monitoring, and usage analytics.",
+  "requestFramePermissions": []
+}
